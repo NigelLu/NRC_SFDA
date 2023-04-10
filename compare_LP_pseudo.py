@@ -10,7 +10,6 @@ import argparse
 import numpy as np
 import os.path as osp
 import torch.nn as nn
-from typing import Tuple
 from datetime import date
 import torch.optim as optim
 from faiss import normalize_L2
@@ -107,7 +106,7 @@ def get_data_loader_dict(args) -> dict:
     return dataset_loader_dict
 
 
-def run_ncc(args, loader: DataLoader, netF: nn.Module, netB: nn.Module, netC: nn.Module, log_func: function = print) -> Tuple(torch.Tensor):
+def run_ncc(args, loader: DataLoader, netF: nn.Module, netB: nn.Module, netC: nn.Module, log_func=print):
     """
         prediction from Nearest Centroid Classifier
     """
@@ -119,7 +118,7 @@ def run_ncc(args, loader: DataLoader, netF: nn.Module, netB: nn.Module, netC: nn
     with torch.no_grad():
         iter_test = iter(loader)
         for _ in range(len(loader)):
-            data = iter_test.next()
+            data = next(iter_test)
             input, label = data[0], data[1]
             feat = netB(netF(input.cuda()))
             output = netC(feat)
@@ -166,7 +165,7 @@ def run_ncc(args, loader: DataLoader, netF: nn.Module, netB: nn.Module, netC: nn
     return new_pred.astype('int'), all_feat, all_label, pred_score
 
 
-def run_pseudo(loader: DataLoader, netF: nn.Module, netB: nn.Module, netC: nn.Module, flag: bool = False, log_func: function = print) -> None:
+def run_pseudo(loader: DataLoader, netF: nn.Module, netB: nn.Module, netC: nn.Module, flag: bool = False, log_func=print) -> None:
     start_test = True
     netF.eval()
     netB.eval()
@@ -174,7 +173,7 @@ def run_pseudo(loader: DataLoader, netF: nn.Module, netB: nn.Module, netC: nn.Mo
     with torch.no_grad():
         iter_test = iter(loader)
         for i in range(len(loader)):
-            data = iter_test.next()
+            data = next(iter_test)
             inputs = data[0]
             labels = data[1]
             inputs = inputs.cuda()
@@ -201,14 +200,15 @@ def run_pseudo(loader: DataLoader, netF: nn.Module, netB: nn.Module, netC: nn.Mo
         acc = ' '.join(aa)
         return aacc, acc
     else:
-        log(f"Pseudo -> accuracy: {accuracy*100}; mean entropy: {mean_ent}")
+        log_func(
+            f"Pseudo -> accuracy: {accuracy*100}; mean entropy: {mean_ent}")
 
 
-def run_label_propagation(args, loader: DataLoader, feat: torch.Tensor, netF: nn.Module, netB: nn.Module, netC: nn.Module, pred_label: torch.Tensor, log_func: function = print) -> None:
+def run_label_propagation(args, loader: DataLoader, feat: torch.Tensor, netF: nn.Module, netB: nn.Module, netC: nn.Module, pred_label: torch.Tensor, log_func=print) -> None:
     _update_plabels(args, feat, pred_label, log_func=log_func)
 
 
-def _update_plabels(args, feat: torch.Tensor, pred_label: torch.Tensor, log_func: function = print, alpha: float = 0.99, max_iter: int = 20) -> torch.Tensor:
+def _update_plabels(args, feat: torch.Tensor, pred_label: torch.Tensor, log_func=print, alpha: float = 0.99, max_iter: int = 20) -> torch.Tensor:
     # * read relevant args
     k = args.k
     class_num = args.class_num
@@ -311,7 +311,10 @@ if __name__ == "__main__":
 
     parser.add_argument('--data_trans', type=str, default='W')
     parser.add_argument('--output', type=str, default='result/')
-    parser.add_argument('--exp_name', type=str, default='Clust_BN')
+    parser.add_argument('--exp_name', type=str, default='LP_pseudo')
+
+    parser.add_argument('--k', type=int, default=10,
+                        help='number of neighbors for label propagation')
 
     args = parser.parse_args()
 
@@ -383,6 +386,6 @@ if __name__ == "__main__":
         run_pseudo(dataset_loader_dict['target'],
                    netF, netB, netC, log_func=log)
         pred_label, feat, label, _ = run_ncc(
-            args, dataset_loader_dict['target'], netF, netB, netC, log_fun=log)
+            args, dataset_loader_dict['target'], netF, netB, netC, log_func=log)
         run_label_propagation(
             args, dataset_loader_dict['target'], feat, netF, netB, netC, pred_label, log_func=log)
