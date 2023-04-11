@@ -1,6 +1,7 @@
 # encoding:utf-8
 
 import os
+import time
 import scipy
 import torch
 import faiss
@@ -30,6 +31,38 @@ VISDA_CLASSES = ['aeroplane', 'bicycle', 'bus', 'car', 'horse' 'knife',
                  'motorcycle', 'person', 'plant', 'skateboard', 'train', 'truck']
 
 # endregion constants
+
+# region class
+
+
+class AverageMeterSet:
+    def __init__(self):
+        self.meters = {}
+
+    def __getitem__(self, key):
+        return self.meters[key]
+
+    def update(self, name, value, n=1):
+        if not name in self.meters:
+            self.meters[name] = AverageMeter()
+        self.meters[name].update(value, n)
+
+    def reset(self):
+        for meter in self.meters.values():
+            meter.reset()
+
+    def values(self, postfix=''):
+        return {name + postfix: meter.val for name, meter in self.meters.items()}
+
+    def averages(self, postfix='/avg'):
+        return {name + postfix: meter.avg for name, meter in self.meters.items()}
+
+    def sums(self, postfix='/sum'):
+        return {name + postfix: meter.sum for name, meter in self.meters.items()}
+
+    def counts(self, postfix='/count'):
+        return {name + postfix: meter.count for name, meter in self.meters.items()}
+# endregion class
 
 # region functions
 
@@ -161,7 +194,6 @@ def run_ncc(args, loader: DataLoader, netF: nn.Module, netB: nn.Module, netC: nn
     new_acc = np.sum(new_pred == all_label.float().numpy()) / len(all_feat)
     log_func('Nearest Clustering Centroid Based Accuracy = {:.2f}% -> {:.2f}%'.format(
         acc * 100, new_acc * 100))
-
     return new_pred.astype('int'), all_feat, all_label, pred_score
 
 
@@ -204,8 +236,55 @@ def run_pseudo(loader: DataLoader, netF: nn.Module, netB: nn.Module, netC: nn.Mo
             f"Pseudo -> accuracy: {accuracy*100}; mean entropy: {mean_ent}")
 
 
-def run_label_propagation(args, loader: DataLoader, feat: torch.Tensor, netF: nn.Module, netB: nn.Module, netC: nn.Module, pred_label: torch.Tensor, log_func=print) -> None:
-    _update_plabels(args, feat, pred_label, log_func=log_func)
+def run_label_propagation(args, loader: DataLoader, feat: torch.Tensor,
+                          netF: nn.Module, netB: nn.Module, netC: nn.Module,
+                          label: torch.Tensor, pred_label: torch.Tensor, log_func=print) -> None:
+    # * get relevant args
+    output_dir_src = args.output_dir_src
+
+    for k in np.arange(3, 11):
+        args.k = k
+        netF.load_state_dict(torch.load(f"{output_dir_src}/source_F.pt"))
+        netB.load_state_dict(torch.load(f"{output_dir_src}/source_B.pt"))
+        netC.load_state_dict(torch.load(f"{output_dir_src}/source_C.pt"))
+        # * obtain pseudo labels via label propagation
+        weights, class_weights, p_labels = _update_plabels(
+            args, feat, pred_label, log_func=log_func)
+        new_acc = np.sum(p_labels == np.asarray(label)) / len(label)
+        log('accuracy after label propagation with k={} is {:.4f}'.format(k, new_acc))
+
+        _train_with_plabels(loader, netF, netB, netC, weights,
+                            class_weights, log_func=log_func)
+
+        start_test = True
+        netF.eval()
+        netB.eval()
+        netC.eval()
+        with torch.no_grad():
+            iter_test = iter(loader)
+            for i in range(len(loader)):
+                data = next(iter_test)
+                inputs = data[0]
+                labels = data[1]
+                inputs = inputs.cuda()
+                outputs = netC(netB(netF(inputs)))
+                if start_test:
+                    all_output = outputs.float().cpu()
+                    all_label = labels.float()
+                    start_test = False
+                else:
+                    all_output = torch.cat(
+                        (all_output, outputs.float().cpu()), 0)
+                    all_label = torch.cat((all_label, labels.float()), 0)
+
+        all_output = nn.Softmax(dim=1)(all_output)
+        _, predict = torch.max(all_output, 1)
+        accuracy = torch.sum(torch.squeeze(predict).float() ==
+                             all_label).item() / float(all_label.size()[0])
+        mean_ent = torch.mean(Entropy(all_output)).cpu().data.item()
+
+        log_func(
+            f"LP -> accuracy: {accuracy*100}; mean entropy: {mean_ent}; k: {args.k}")
 
 
 def _update_plabels(args, feat: torch.Tensor, pred_label: torch.Tensor, log_func=print, alpha: float = 0.99, max_iter: int = 20) -> torch.Tensor:
@@ -247,8 +326,6 @@ def _update_plabels(args, feat: torch.Tensor, pred_label: torch.Tensor, log_func
     D = scipy.sparse.diags(D.reshape(-1))
     Wn = D * W * D
 
-    breakpoint()
-
     # * Initiliaze the y vector for each class (eq 5 from the paper, normalized with the class size) and apply label propagation
     Z = np.zeros((N, int(class_num)))
     A = scipy.sparse.eye(Wn.shape[0]) - alpha * Wn
@@ -265,11 +342,70 @@ def _update_plabels(args, feat: torch.Tensor, pred_label: torch.Tensor, log_func
     # * Compute the weight for each instance based on the entropy (eq 11 from the paper)
     probs_l1 = F.normalize(torch.tensor(Z), p=1, dim=1).numpy()
     probs_l1[probs_l1 < 0] = 0
-    return probs_l1
+    entropy = scipy.stats.entropy(probs_l1.T)
+    weights = 1 - entropy / np.log(int(class_num))
+    weights = weights / np.max(weights)
+    p_labels = np.argmax(probs_l1, 1)
+
+    class_weights = np.ones((int(class_num),), dtype=np.float32)
+    # * Compute the weight for each class
+    for i in range(int(class_num)):
+        cur_idx = np.where(np.asarray(p_labels) == i)[0]
+        class_weights[i] = (float(pred_label.shape[0]) /
+                            int(class_num)) / cur_idx.size
+
+    return weights, class_weights, p_labels
 
 
-def _train_with_plabels():
-    pass
+def _train_with_plabels(loader: DataLoader, netF: nn.Module, netB: nn.Module, netC: nn.Module, weights, class_weights, log_func=print):
+    # * loss functions
+    class_criterion = nn.CrossEntropyLoss(
+        ignore_index=-1, reduction="none").cuda()
+
+    meters = AverageMeterSet()
+    # * init the optimizers
+    param_group = [{'params': netF.parameters(), 'lr': args.lr * 0.1},
+                   {'params': netB.parameters(), 'lr': args.lr * 1}]
+    param_group_c = [{'params': netC.parameters(), 'lr': args.lr * 1}]
+
+    optimizer = op_copy(optim.SGD(param_group))
+    optimizer_c = op_copy(optim.SGD(param_group_c))
+
+    netF.train()
+    netB.train()
+    netC.train()
+
+    end = time.time()
+
+    for i, data in enumerate(loader):
+        inputs, labels = data[0], data[1]
+        meters.update(f"Data time: {time.time() - end}")
+
+        input_var = torch.autograd.Variable(inputs)
+        target_var = torch.autograd.Variable(labels)
+        weights_var = torch.autograd.Variable(weights)
+        class_weights_var = torch.autograd.Variable(class_weights)
+
+        b_size = len(target_var)
+
+        class_logits = netC(netB(netF(input_var)))
+
+        loss = class_criterion(class_logits, target_var)
+        loss = loss * weights_var.float()
+        loss = loss * class_weights_var
+        loss = loss.sum() / b_size
+        meters.update("class_loss", loss.item())
+
+        optimizer.zero_grad()
+        optimizer_c.zero_grad()
+
+        loss.backward()
+
+        optimizer.step()
+        optimizer_c.step()
+
+        meters.update(f"Batch time: {time.time() - end}")
+        end = time.time()
 
 # endregion functions
 
@@ -311,7 +447,7 @@ if __name__ == "__main__":
 
     parser.add_argument('--data_trans', type=str, default='W')
     parser.add_argument('--output', type=str, default='result/')
-    parser.add_argument('--exp_name', type=str, default='LP_pseudo')
+    parser.add_argument('--exp_name', type=str, default='LP_ncc_pseudo')
 
     parser.add_argument('--k', type=int, default=10,
                         help='number of neighbors for label propagation')
@@ -374,18 +510,10 @@ if __name__ == "__main__":
         netB.load_state_dict(torch.load(f"{args.output_dir_src}/source_B.pt"))
         netC.load_state_dict(torch.load(f"{args.output_dir_src}/source_C.pt"))
 
-        # * init the optimizers
-        # param_group = [{'params': netF.parameters(), 'lr': args.lr * 0.1},
-        #                {'params': netB.parameters(), 'lr': args.lr * 1}]
-        # param_group_c = [{'params': netC.parameters(), 'lr': args.lr * 1}]
-
-        # optimizer = op_copy(optim.SGD(param_group))
-        # optimizer_c = op_copy(optim.SGD(param_group_c))
-
         # * run analysis
         run_pseudo(dataset_loader_dict['target'],
                    netF, netB, netC, log_func=log)
         pred_label, feat, label, _ = run_ncc(
             args, dataset_loader_dict['target'], netF, netB, netC, log_func=log)
         run_label_propagation(
-            args, dataset_loader_dict['target'], feat, netF, netB, netC, pred_label, log_func=log)
+            args, dataset_loader_dict['target'], feat, netF, netB, netC, label, pred_label, log_func=log)
