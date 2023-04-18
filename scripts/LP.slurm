@@ -19,7 +19,9 @@ sif_path=/scratch/$USER/cuda11.4.2-cudnn8.2.4-devel-ubuntu20.04.3.sif
 singularity exec --nv \
 --overlay ${ext3_path}:ro \
 ${sif_path} /bin/bash -c "
+. ~/.bashrc
 conda deactivate && conda activate nrc
+python --version
 cd /scratch/xl3139/NRC_SFDA
 python compare_LP_pseudo.py --worker 2
 "

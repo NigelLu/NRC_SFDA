@@ -8,9 +8,11 @@ import faiss
 import random
 import network
 import argparse
+import tracemalloc
 import numpy as np
 import os.path as osp
 import torch.nn as nn
+from typing import List
 from datetime import date
 import torch.optim as optim
 from faiss import normalize_L2
@@ -33,6 +35,28 @@ VISDA_CLASSES = ['aeroplane', 'bicycle', 'bus', 'car', 'horse' 'knife',
 # endregion constants
 
 # region class
+
+
+class AverageMeter:
+    """Computes and stores the average and current value"""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * float(n)
+        self.count += float(n)
+        self.avg = self.sum / self.count
+
+    def __format__(self, format):
+        return "{self.val:{format}} ({self.avg:{format}})".format(self=self, format=format)
 
 
 class AverageMeterSet:
@@ -197,7 +221,8 @@ def run_ncc(args, loader: DataLoader, netF: nn.Module, netB: nn.Module, netC: nn
     return new_pred.astype('int'), all_feat, all_label, pred_score
 
 
-def run_pseudo(loader: DataLoader, netF: nn.Module, netB: nn.Module, netC: nn.Module, flag: bool = False, log_func=print) -> None:
+def run_pseudo(loader: DataLoader, netF: nn.Module, netB: nn.Module, netC: nn.Module, log_func=print) -> List[torch.Tensor]:
+
     start_test = True
     netF.eval()
     netB.eval()
@@ -215,8 +240,11 @@ def run_pseudo(loader: DataLoader, netF: nn.Module, netB: nn.Module, netC: nn.Mo
                 all_label = labels.float()
                 start_test = False
             else:
-                all_output = torch.cat((all_output, outputs.float().cpu()), 0)
+                all_output = torch.cat(
+                    (all_output, outputs.float().cpu()), 0)
                 all_label = torch.cat((all_label, labels.float()), 0)
+
+    # breakpoint()
 
     all_output = nn.Softmax(dim=1)(all_output)
     _, predict = torch.max(all_output, 1)
@@ -224,16 +252,8 @@ def run_pseudo(loader: DataLoader, netF: nn.Module, netB: nn.Module, netC: nn.Mo
                          all_label).item() / float(all_label.size()[0])
     mean_ent = torch.mean(Entropy(all_output)).cpu().data.item()
 
-    if flag:
-        matrix = confusion_matrix(all_label, torch.squeeze(predict).float())
-        acc = matrix.diagonal()/matrix.sum(axis=1) * 100
-        aacc = acc.mean()
-        aa = [str(np.round(i, 2)) for i in acc]
-        acc = ' '.join(aa)
-        return aacc, acc
-    else:
-        log_func(
-            f"Pseudo -> accuracy: {accuracy*100}; mean entropy: {mean_ent}")
+    log_func(
+        f"Pseudo -> accuracy: {accuracy*100}; mean entropy: {mean_ent}")
 
 
 def run_label_propagation(args, loader: DataLoader, feat: torch.Tensor,
@@ -254,7 +274,7 @@ def run_label_propagation(args, loader: DataLoader, feat: torch.Tensor,
         log('accuracy after label propagation with k={} is {:.4f}'.format(k, new_acc))
 
         _train_with_plabels(loader, netF, netB, netC, weights,
-                            class_weights, log_func=log_func)
+                            class_weights, p_labels=p_labels, log_func=log_func)
 
         start_test = True
         netF.eval()
@@ -336,7 +356,7 @@ def _update_plabels(args, feat: torch.Tensor, pred_label: torch.Tensor, log_func
         f, _ = scipy.sparse.linalg.cg(A, y, tol=1e-6, maxiter=max_iter)
         Z[:, i] = f
 
-    # * Handle numberical errors
+    # * Handle numerical errors
     Z[Z < 0] = 0
 
     # * Compute the weight for each instance based on the entropy (eq 11 from the paper)
@@ -357,12 +377,34 @@ def _update_plabels(args, feat: torch.Tensor, pred_label: torch.Tensor, log_func
     return weights, class_weights, p_labels
 
 
-def _train_with_plabels(loader: DataLoader, netF: nn.Module, netB: nn.Module, netC: nn.Module, weights, class_weights, log_func=print):
+def _train_with_plabels(loader: DataLoader, netF: nn.Module, netB: nn.Module, netC: nn.Module, weights, class_weights, p_labels, max_iter=1, log_func=print):
     # * loss functions
     class_criterion = nn.CrossEntropyLoss(
         ignore_index=-1, reduction="none").cuda()
 
     meters = AverageMeterSet()
+
+    start_test = True
+    iter_test = iter(loader)
+    for i in range(len(loader)):
+        data = next(iter_test)
+        inputs = data[0]
+        labels = data[1]
+        inputs = inputs.cuda()
+
+        if start_test:
+            all_inputs = inputs
+            all_label = labels
+            start_test = False
+        else:
+            all_inputs = torch.cat(
+                (all_inputs, inputs), 0)
+            all_label = torch.cat((all_label, labels), 0)
+
+    # * put all_inputs and all_labels to GPU
+    all_inputs = all_inputs.cuda()
+    all_labels = all_labels.float()
+
     # * init the optimizers
     param_group = [{'params': netF.parameters(), 'lr': args.lr * 0.1},
                    {'params': netB.parameters(), 'lr': args.lr * 1}]
@@ -376,36 +418,50 @@ def _train_with_plabels(loader: DataLoader, netF: nn.Module, netB: nn.Module, ne
     netC.train()
 
     end = time.time()
-
-    for i, data in enumerate(loader):
-        inputs, labels = data[0], data[1]
+    for _ in range(max_iter):
         meters.update(f"Data time: {time.time() - end}")
 
-        input_var = torch.autograd.Variable(inputs)
-        target_var = torch.autograd.Variable(labels)
+        input_var = torch.autograd.Variable(all_inputs)
+        target_var = torch.autograd.Variable(p_labels)
         weights_var = torch.autograd.Variable(weights)
         class_weights_var = torch.autograd.Variable(class_weights)
 
         b_size = len(target_var)
+        meters.update(f"Mini-batch size: {b_size}")
 
         class_logits = netC(netB(netF(input_var)))
 
+        # * compute the loss
         loss = class_criterion(class_logits, target_var)
         loss = loss * weights_var.float()
         loss = loss * class_weights_var
         loss = loss.sum() / b_size
         meters.update("class_loss", loss.item())
 
+        # * back-propagation
         optimizer.zero_grad()
         optimizer_c.zero_grad()
-
         loss.backward()
-
         optimizer.step()
         optimizer_c.step()
 
         meters.update(f"Batch time: {time.time() - end}")
         end = time.time()
+
+    netF.eval()
+    netB.eval()
+    netC.eval()
+    with torch.no_grad():
+        all_output = netC(netB(netF(all_inputs)))
+
+    all_output = nn.Softmax(dim=1)(all_output)
+    _, predict = torch.max(all_output, 1)
+    accuracy = torch.sum(torch.squeeze(predict).float() ==
+                         all_label).item() / float(all_label.size()[0])
+    mean_ent = torch.mean(Entropy(all_output)).cpu().data.item()
+
+    log_func(
+        f"After LP -> accuracy: {accuracy*100}; mean entropy: {mean_ent}")
 
 # endregion functions
 
@@ -510,10 +566,13 @@ if __name__ == "__main__":
         netB.load_state_dict(torch.load(f"{args.output_dir_src}/source_B.pt"))
         netC.load_state_dict(torch.load(f"{args.output_dir_src}/source_C.pt"))
 
+        # breakpoint()
         # * run analysis
         run_pseudo(dataset_loader_dict['target'],
                    netF, netB, netC, log_func=log)
+        # breakpoint()
         pred_label, feat, label, _ = run_ncc(
             args, dataset_loader_dict['target'], netF, netB, netC, log_func=log)
+        # breakpoint()
         run_label_propagation(
             args, dataset_loader_dict['target'], feat, netF, netB, netC, label, pred_label, log_func=log)
